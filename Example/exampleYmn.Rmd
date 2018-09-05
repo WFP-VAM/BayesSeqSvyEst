@@ -1,5 +1,7 @@
 ---
 title: "Bayesian Sequential Survey Estimator Demo on Yemen mVAM Data"
+author: "Gaurav Singhal"
+date: '2018-09-05'
 ---
 
 ##Intro - Data Prep
