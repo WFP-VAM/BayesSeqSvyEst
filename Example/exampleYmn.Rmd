@@ -1,8 +1,5 @@
 ---
 title: "Bayesian Sequential Survey Estimator Demo on Yemen mVAM Data"
-output:
-  html_notebook: default
-  html_document: default
 ---
 
 ##Intro - Data Prep
