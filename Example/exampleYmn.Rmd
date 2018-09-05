@@ -1,0 +1,381 @@
+---
+title: "Bayesian Sequential Survey Estimator Demo on Yemen mVAM Data"
+output:
+  html_notebook: default
+  html_document: default
+---
+
+##Intro - Data Prep
+
+In this notebook we use the Bayesian Suquential Survey Estimator on an mVAM dataset collected in Yemen starting in March of 2018.  We use three datasets:
+
+(1) mVAM data - collected daily over the phone with key demographic variables and the Food Consumption Score indicator
+
+(2) Baseline data (F2F)- Emergency Food Security and Nutrition Assessment (EFSNA) data collected face-to-face in Yemen during ceasefire in fall of 2016. Also contains key demographic variables and the Food Consumption Score indicator
+
+(3) Demographic and Health Survey (DHS) data - 2013 survey of over 17000 households in Yemen collecting key demographic and health indicators. does not have Food Consumption Score, but we use it solely for the purpose of posterior simulation, predicting FCS from the demographic variables, which are presumably as representative as can be without a census
+
+We also use an additional dataset of population by governorate to convert prevalence estimates to absolute values.
+```{r,eval=FALSE}
+##################
+### Data Prep  ###
+##################
+library(xlsx)
+library(survey)
+library(plyr)
+
+#mvam Suvey- data we will use to update baseline model
+ymnRspDF <- data.table::fread('ymnData/mVAMYmnObs.csv',sep=';',na.strings='')
+
+#DHS Survey - demographic data to use for posterior simulation
+dhsDF <- data.table::fread('ymnData/DHS2013.csv',sep=';',na.strings='')
+dhsDF <- as.data.frame(dhsDF)
+
+#EFSNA face-t0-face survey - data to fit baseline model (this dataset is confidential and cannot be shared)
+efsnaDF <- data.table::fread('ymnData/ymnEFSNA2016.csv',sep=';',na.strings='')
+
+#Population Data
+ymnPopDF <- read.xlsx('C:/Users/gaurav.singhal/Desktop/ymnSeqMdl/cso_2017_population_projection_sexage_disagreggated.xlsx',
+                      sheetIndex=1)
+
+#Create table for IPC Phase
+svyYmn <- svydesign(ids=~Cluster_No+ID,
+                    strata=~ADM1_NAME+NULL,
+                    weights=~weight,
+                    pps='brewer',
+                    data=efsnaDF,
+                    nest=TRUE)
+
+ymn.FCG.2016 <- prop.table(svytable(~ADM1_NAME+FCS_Cat,svyYmn),1)
+colnames(ymn.FCG.2016) <- c('2016.Severe','2016.Moderate','2016.OK')
+ymn.FCG.2016 <- rbind(ymn.FCG.2016,ymn.FCG.2016[c("Hajjah","Hadramaut"),])
+rownames(ymn.FCG.2016)[dim(ymn.FCG.2016)[1]-1] <- "Sa'ada"
+rownames(ymn.FCG.2016)[dim(ymn.FCG.2016)[1]] <- "Al Maharah"
+ymn.FCG.2016 <- as.data.frame(ymn.FCG.2016)
+
+#Assign IPC phase to governorates
+ymn.FCG.2016$IPCclass <- 'Emergency'
+stressed <- c('Hadramaut','Al Maharah')
+ymn.FCG.2016$IPCclass[rownames(ymn.FCG.2016) %in% stressed] <- 'Stressed'
+crisis <- c('Al Jawf','Marib','Amran','Amanat Al Asimah','Al Mahwit','Al Hudaydah','Dhamar','Raymah','Ibb')
+ymn.FCG.2016$IPCclass[rownames(ymn.FCG.2016) %in% crisis] <- 'Crisis'
+ymn.FCG.2016$ADM1_NAME <- rownames(ymn.FCG.2016)
+rm(svyYmn,stressed,crisis)
+
+#Filter mVAM dataset for latest questionnaire and Merge
+colsmVAM <- c('ObsID','RspID','SvyID','SelectWt','CmbAdjWt','ADM1_NAME','ADM2_NAME',
+              'rCSI','FCS','FCG','FoodInsecure','isUrban','isIDP',
+              'HHSizeGrp','HoHSex_is_F','HoHEdu','H2OSrc','FuelSrc','HH_has_Elctrc','Toilet_is_Flush')
+
+mvamDF <- as.data.frame(ymnRspDF[ymnRspDF$SvyID>=181,])
+mvamDF <- mvamDF[,colSums(is.na(mvamDF))<0.9*nrow(mvamDF)]
+mvamDF <- mvamDF[complete.cases(mvamDF[,colsmVAM]),]
+mvamDF <- mvamDF[,append(colsmVAM,setdiff(colnames(mvamDF),colsmVAM))]
+mvamDF <- merge(mvamDF,ymn.FCG.2016,all.x=TRUE,by='ADM1_NAME')
+mvamDF$FreeResponse <- NULL
+mvamDF$FreeResponseEng <- NULL
+
+#Filter DHS dataset for complete.cases and merge
+colsDHS <- c('HHID','ADM1_NAME','wgt','HHS_Class','HHS_Score','isUrban',
+             'HHSizeGrp','HoHSex_is_F','HoHEdu','H2OSrc','FuelSrc','HH_has_Elctrc','Toilet_is_Flush')
+dmgDF <- as.data.frame(dhsDF)
+dmgDF <- dmgDF[complete.cases(dmgDF[,colsDHS]),]
+dmgDF <- dmgDF[,append(colsDHS,setdiff(colnames(dhsDF),colsDHS))]
+dmgDF <- merge(dmgDF,ymn.FCG.2016,all.x=TRUE,by='ADM1_NAME')
+
+#Filter EFSNA df for complete.cases and merge
+colsEFSNA <- c('ID','ADM1_NAME','wgt','isUrban','FCS','isIDP',
+               'HHSizeGrp','HoHSex_is_F','HoHEdu','H2OSrc','FuelSrc','HH_has_Elctrc','Toilet_is_Flush')
+efsnaDF <- as.data.frame(efsnaDF)
+baseDF <- efsnaDF[complete.cases(efsnaDF[,colsEFSNA]),]
+baseDF <- baseDF[,colsEFSNA]
+baseDF <- merge(baseDF,ymn.FCG.2016,all.x=TRUE,by='ADM1_NAME')
+baseDF$FCS[baseDF$FCS<12] <- 12
+baseDF$logFCS.2016 <- log(baseDF$FCS)
+
+#add rows for Sa'ada and Al Maharah as they are missing the original baseline data
+extDF <- baseDF[baseDF$ADM1_NAME %in% c('Hajjah','Hadramaut'),]
+extDF$ADM1_NAME <- revalue(extDF$ADM1_NAME,c('Hajjah'="Sa'ada",'Hadramaut'='Al Maharah'))
+baseDF <- rbind(baseDF,extDF)
+baseDF$ADM1_NAME <- as.character(baseDF$ADM1_NAME)
+rm(extDF)
+
+print('Data Loaded!')
+```
+
+####baseline dataset
+```{r,echo=FALSE}
+head(baseDF)
+```
+
+####mVAM dataset
+```{r,echo=FALSE}
+head(mvamDF[,c(intersect(colnames(baseDF),colnames(mvamDF)),'SelectWt','ObsDate','SvyID')])
+```
+
+####DHS dataset
+```{r,echo=FALSE}
+head(dhsDF[,intersect(colnames(baseDF),colnames(dhsDF))])
+```
+
+##Construct initial baseline model
+
+Next we construct a multi-level random effect model on the baseline F2F data, that predicts log(FCS) on the host of available demographic and socioeconomic information.  Effectively the models are dividing the population into a myriad of _cells_ demograpahically decohering the log(FCS) estimates such that we are estimating the marginal distributions of log(FCS) by demographic covariate. Those covariates that are not independent of each other (such as IPC phase and governorate) are appropriately nested such that the nested variable is conditionally independent on the other). The joint probabilities of the marginal distributions yield the individual demographic-cell value, allowing sparse cells (those with few observations) to _borrow strength_ from neighboring cells.
+
+First we use lme4 to fit a non-Bayesian model based on maximizing the Random-Effects Maximum Likelihood criterion. Those estimates are then set as priors to the same model but estimated using rstanarm's Markov Chain Monte Carlo estimator. The results should largely be the same, but the latter model can be Bayes' updated with new information.
+```{r,eval=FALSE}
+#####################################
+### Create initial baseline model ###
+#####################################
+library(lme4)
+library(rstanarm)
+
+#create model formula
+base.fmla <- as.formula(log(FCS) ~ HoHSex_is_F+HH_has_Elctrc+Toilet_is_Flush+isUrban+
+                   (1|HHSizeGrp)+(1|HoHEdu)+(1|H2OSrc)+(1|FuelSrc)+(1|IPCclass/ADM1_NAME))
+
+#(A) fit REML model using lme4 on the baseline data
+base.mdl <- lmer(base.fmla,data=baseDF,weights=wgt)
+
+#(B) fit Bayiesn model using lme model values as priors. We inflate the estimated variance to give the MCMC sampler more 'search room'
+base.mdl.stan <- stan_lmer(base.fmla,data=baseDF,weights=wgt,
+                           iter=3000,chains=4,cores=4,thin=2,control=list(adapt_delta=.965),QR=TRUE,
+                           prior_intercept = normal(offset.mdl@beta[1],sqrt(vcov(base.mdl)[1,1])*10))
+rm(base.mdl)
+```
+
+##Construct mode-effect model
+
+The above model allows us to correct for differences in demographics with our mVAM surveys, as we are using the mVAM information to solely estimate the mean and variances of the demographic marginal distributions with respect to log(FCS). However, as mVAM uses a different modality--phone vs face-to-face--there exists a second form bias whereby respondents' estimates change due to survey mode. We eliminate this bias with the assumption that is is fixed (not dependent on time) and dependent on the respondents' socio-demographic profile as well. Therefore we take an mVAM dataset from the same time period, use the above model to predict FCS (out-of-sample) using the socio-demographic variables in the mVAM dataset, and compute its' errors vis-a-vis the reported mVAM FCS.  Those errors are then the respondents' theorized estimate of 'mode-effect.' We regress the same hierarchical random-effects model on the errors to then predict 'mode-effect' on new respondents. Ergo, when new mVAM data arrives. We first run the mode-effect correction model to adjust the respondents' corresponding log(FCS) for mode-bias. As the mode-effect itself is a random variable, we must use the bootstrap technique to compute subsequent variances.
+```{r,eval=FALSE}
+#########################################
+### Create mode-effect (offset) model ###
+#########################################
+##(2) fit offset model to correct for mode effect using the residuals of the baseline model simulated on mVAM data
+
+#(A) massage mvam data first because Sa'ada and Al Maharah governorates missing from baseline survey
+###  we assume Sa'ada=Hajjah and Al Maharah="Hadramaut for this purpose
+mvamDF$ADM1_NAME <- as.factor(mvamDF$ADM1_NAME)
+mvamDF$ADM1_NAME_ACTUAL <- mvamDF$ADM1_NAME
+mvamDF$ADM1_NAME <- droplevels(revalue(mvamDF$ADM1_NAME,c("Sa'ada"="Hajjah","Al Maharah"="Hadramaut")))
+
+#(B) now perform posterior simulations (i.e. predictions) of the previous baseline model on the new mVAM data
+mvamDF$logFCS.prior <- rowMeans(t(posterior_predict(base.mdl.stan,newdata=mvamDF[,c(colsmVAM,'IPCclass')],
+                                                    draws=500)))
+
+#(C) now as know actual reported log(FCS) from the mVAM data, compute differences vis-a-vis the above predictions mvamDF$logFCS.diff <- with(mvamDF,log(FCS)-logFCS.prior)
+
+#(D) revert governorates
+mvamDF$ADM1_NAME <- mvamDF$ADM1_NAME_ACTUAL
+mvamDF$ADM1_NAME_ACTUAL <- NULL
+
+### Model Formula
+offset.fmla <- as.formula(logFCS.diff ~ HoHSex_is_F+HH_has_Elctrc+Toilet_is_Flush+isUrban+
+                     (1|HHSizeGrp)+(1|HoHEdu)+(1|H2OSrc)+(1|FuelSrc)+(1|IPCclass/ADM1_NAME))
+
+#NOTE: SvyID==181 is a filter as to use only 1 round of information corresponding to mVAM's closest available time period to when the F2F survey was completed
+
+#(E) first fit lme model as prior for rstanarm model 
+offset.mdl <- lmer(offset.fmla,data=mvamDF[mvamDF$SvyID==181,],weights=SelectWt)
+
+#(F) fit rstanarm with lme prior
+offset.mdl.stan <- stan_lmer(offset.fmla,weights=SelectWt,
+                             iter=3000,chains=4,cores=4,thin=2,control=list(adapt_delta=.965),QR=TRUE,
+                             prior_intercept = normal(offset.mdl@beta[1],sqrt(vcov(offset.mdl)[1,1])*10))
+rm(offset.mdl)
+```
+
+##Perform Bayesian Sequential Update on models with new data
+
+With these two models in place we can now perform Bayesian sequential updates as new mVAM data arrives upon the baseline model that predicts log(FCS) as a function of socio-demographic variables. This is done as a batch process using a rolling window over the data of a specified time length (usually 30 days). The model for the new moving window is computed by performing a Bayesian sequential update, that is using the previous parameter estimates as a prior for the new parameter estimates, on the previous window's model using only the data from the current moving window. This is repeated for the whole sequence moving windows in the dataset.
+
+An important note is that at the first Bayesian sequential update, the model is adjusted to include the estimates from the baseline model, that is we add the term `log(FCS)_baseline` to the right-hand-side of the regression equation, i.e. `log(FCS)_mvam_t ~ {sociodemographic random effect variables} + log(FCS)_baseline` where `log(FCS)_baseline` are the predictions from the baseline model.  Hence the priors for the random-effects come from the offset model, not the baseline model. And the random effects are effectively estimating the difference between the mVAM results and the baseline results, just as the offset model does.  We call this set-up the 'cross-sectional' version of the Bayesian sequential update process. Another option is to use the previous time-window's model estimate of log(FCS) in the RHS, i.e. `log(FCS)_mvam_t ~ {sociodemographic random effect variables} + log(FCS)_mvam_t-1`. We call this set-up to be the 'auto-regressive' version.
+
+Furthermore, the round of information used to compute the above offset is discarded. The reason for doing so is obvious; we will be effectively returning the results from the F2F survey.
+```{r,eval=FALSE}
+
+#source code for Bayesian Sequential Survey Estimator
+#assume current working directory is repository root
+source('./R/seqSvyEst.R')
+
+#Estimate models over time windows (using cross-sectional modelling approach)
+seq.mdls <- seq.estimator.XS(mvamDF[,c(colsmVAM,'IPCclass','logFCS.prior')],base.mdl.stan,mvamDF$ObsDate)
+
+```
+
+##Simulate posterior on DHS data
+
+Now with the posterior (updated with mvam data) models in hand for each time-step we simulate the results on the DHS dataset, providing the most representative breakdown of the socio-demographic characteristics of our population withstanding the existence of a proper census. 
+
+The function returns the probability distribution function and quantile function of FCS by strata by time-window
+
+```{r, eval=FALSE}
+
+#Return estimates via simulating models on DHS data for each window
+rslt.DHS <- mdl.simulator(seq.mdls,offset.mdl.stan,dmgDF[,c(colsDHS,'IPCclass')],'ADM1_NAME','wgt')
+
+```
+
+####Result by prevalence of food consumption categories
+```{r,echo=FALSE}
+head(rslt.DHS$str.est)
+```
+####Result by quantile
+```{r,echo=FALSE}
+head(rslt.DHS$qnt.est)
+```
+####Result by probability distribution
+```{r,echo=FALSE}
+head(rslt.DHS$pdf.est)
+```
+
+##Oooh, it's plotting time!
+
+Now with results in hand, we can make some pretty plots :)
+
+####Plot A: Evolution of mean FCS over time by Governorate
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(scales)
+library(stringr)
+library(stringi)
+#function to rowbind when column names are different
+force_bind = function(df1, df2) {
+  colnames(df2) = colnames(df1)
+  bind_rows(df1, df2)
+}
+
+ggplot(data=rslt.DHS$str.est %>% group_by(ADM1_NAME) %>% mutate(avgFCS=mean(FCSMean)),
+       mapping=aes(x=End.Date,FCSMean,CI.Lo.FCS,CI.Hi.FCS,color=avgFCS,fill=avgFCS))+
+  geom_line(aes(y = FCSMean))+
+  geom_ribbon(aes(ymin=CI.Lo.FCS, ymax=CI.Hi.FCS),alpha=0.5,color=NA)+facet_wrap(~ADM1_NAME)+
+  scale_fill_gradient(low='red',high='blue')+scale_colour_gradient(low='red',high='blue')+
+  scale_x_date(breaks = pretty_breaks(14))+
+  scale_y_continuous(minor_breaks = seq(80,80,5),breaks = seq(30,80,10))+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid.major.y = element_line(colour="grey", size=0.5))
+
+```
+
+
+####Plot B: Evolution of prevalence of food consumption groups over time by Governorate
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+ggplot(force_bind(cbind(rslt.DHS$str.est[,c(1,3,7,8,9)],'threshold'='poor'),
+                  cbind(rslt.DHS$str.est[,c(1,3,10,11,12)],'threshold'='poorbrdr')),
+       mapping=aes(x=End.Date,PctPoor,CI.Hi.Poor,CI.Lo.Poor,fill=threshold,color=threshold))+
+  geom_line(aes(y = PctPoor))+
+  geom_ribbon(aes(ymin=CI.Lo.Poor,ymax=CI.Hi.Poor),alpha=0.5,show.legend=FALSE,colour=NA)+facet_wrap(~ADM1_NAME)+
+  scale_x_date(breaks = pretty_breaks(14))+
+  scale_y_continuous(minor_breaks = seq(15,75,5)/100,breaks = seq(15,75,10)/100)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid.major.y = element_line(colour="grey", size=0.5))
+
+```
+
+####Plot C: Evolution of probability distribution of FCS for all of Yemen over time
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+library(plotly)
+
+df <- rslt.DHS$pdf.est %>% filter(ADM1_NAME=='Yemen') %>% select(-ADM1_NAME)
+plot_ly(x=df$End.Date,y=c(20:60),
+        z=t(as.matrix(df[,as.character(c(20:60))]))/10000,type='contour',autocontour=TRUE) %>%
+  layout(xaxis=list(title='Date'),yaxis=list(title='FCS'),title='Evolution of FCS distribution from Apr-June')
+rm(df)
+
+```
+
+####Plot D: Prevalence map of Poor Food Consumption over time
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+#convert spatial polygons dataframe
+shp.DF <- fortify(ymnGDF) %>%
+  left_join(data_frame(id=rownames(ymnGDF@data), name=ymnGDF@data$ADM1_NAME)) %>%
+  select(-id) %>% rename(id=name)
+
+#assemble dataframe
+dat.DF <- rslt.Base$str.est[rslt.Base$str.est$ADM1_NAME!='Yemen',c('ADM1_NAME','End.Date','PctPoor','NumPoor')]
+colnames(dat.DF)[1] <- 'id'
+#reformat so prevalence is in buckets of 15% to 55% by 5% increments
+breaks.prv <- seq(15,55,5)
+breaks.lbl <- sprintf("%2.1f-%s", breaks.prv, percent(lead(breaks.prv/100))) %>%
+  stri_replace_all_regex(c("^0.0", "-NA%"), c("0", "%"), vectorize_all=FALSE) %>% head(-1)
+dat.DF <- dat.DF %>% mutate(`PoorFCS%`=cut(PctPoor,breaks.prv/100,breaks.lbl))
+
+#plot
+ggplot()+
+  geom_polygon(data=shp.DF,aes(x=long,y=lat, group=group),fill='white',color='#7f7f7f',size=0.15)+
+  geom_map(data=dat.DF, map=shp.DF,aes(map_id=id, fill=`PoorFCS%`),color="#7f7f7f", size=0.15)+
+  scale_fill_manual(values=colorRampPalette(c("yellow", "red"))(length(breaks.lbl)))+
+  guides(fill=guide_legend(override.aes=list(colour=NA)))+
+  labs(title="% Poor FCS by Week")+
+  facet_wrap(~End.Date)+
+  theme(legend.position="top")
+rm(breaks.lbl,breaks.prv)
+
+```
+
+####Plot E: Convert prevalence to number of people in need
+
+```{r,echo=TRUE, message=FALSE, warning=FALSE}
+
+breaks.num <- seq(0,1500000,100000)
+breaks.lbl <- sprintf("%2.0f-%2.0fk", breaks.num/1000, lead(breaks.num)/1000) %>% head(-1)
+dat.DF <- dat.DF %>% mutate(`NumPoorFCS`=cut(NumPoor,breaks.num,breaks.lbl))
+
+ggplot()+
+  geom_polygon(data=shp.DF,aes(x=long,y=lat, group=group),fill='white',color='#7f7f7f',size=0.15)+
+  geom_map(data=dat.DF, map=shp.DF,aes(map_id=id, fill=`NumPoorFCS`),color="#7f7f7f", size=0.15)+
+  scale_fill_manual(values=colorRampPalette(c("yellow", "red"))(length(breaks.lbl)))+
+  guides(fill=guide_legend(override.aes=list(colour=NA)))+
+  labs(title="Num Poor FCS by Week")+
+  facet_wrap(~End.Date)+
+  theme(legend.position="top")
+rm(breaks.lbl,breaks.num)
+
+rm(dat.DF)
+
+```
+
+####Plot F: Comparison of traditional mVAM estimates with Bayesian Sequential Update
+
+Now we compare the above results to what we get through our traditional mVAM estimates. These estimates use the standard Horowtiz-Thompson estimator (i.e. weighted average) for stratified random sample survey designs with first-stage selection weights determined by number of phones owned by the household and a final post-stratification weighting by IDP status. Each survey round is discrete.
+
+For ground-truth we use the governorate-level food-distribution targets for May 2018. These are typically tabulated by the estimated prevalence rate of poor food consumption coming from ad-hoc face-to-face convenience surveys conducted quarterly. Hence, for comparison we use the April mVAM data round and the Bayesian Sequential Estimates from the period beteween 2nd of April and 2nd of May.
+```{r,echo=TRUE, message=FALSE, warning=FALSE}
+
+##dataset preloaded as cmpr.DF
+
+ggplot()+
+  geom_polygon(data=shp.DF,aes(x=long,y=lat, group=group),fill='white',color='#7f7f7f',size=0.15)+
+  geom_map(data=cmpr.DF[cmpr.DF$Type!='EFSA',], 
+           map=shp.DF,aes(map_id=id, fill=NumPop),color="#7f7f7f", size=0.15)+
+  scale_fill_gradient(low='blue',high='red',
+                      guide = guide_legend(
+                        label.theme = element_text(angle = 90)))+
+  guides(fill=guide_legend(title='Estimated Population'))+
+  labs(title="Num Poor FCS by Source")+
+  facet_wrap(~Type)+
+  theme(legend.position="top")
+
+```
+
+####Plot G: Percent difference with Targeted amounts for mVAM vs Bayesian Sequential Update
+
+```{r,echo=TRUE, message=FALSE, warning=FALSE}
+ggplot()+
+  geom_polygon(data=shp.DF,aes(x=long,y=lat, group=group),fill='white',color='#7f7f7f',size=0.15)+
+  geom_map(data=cmpr.DF[!(cmpr.DF$Type %in% c('Targeted','EFSA')),], 
+           map=shp.DF,aes(map_id=id, fill=PctDiff*100),color="#7f7f7f", size=0.15)+
+  scale_fill_gradient2(low='red',high='blue',mid='white',
+                       guide = guide_legend(
+                         label.theme = element_text(angle = 90)))+
+  guides(fill=guide_legend(title='%Diff'))+
+  labs(title="% Difference with May Food Distribution Targets")+
+  facet_wrap(~Type,ncol=2)+
+  theme(legend.position="top")
+```
