@@ -38,7 +38,7 @@ Next steps include:
 
 ### Special Thanks to
 
-Dr. Seth Flaxman of Imperial University was of great help in getting this project off the ground. There is much more work to be done--but we would like to give him recognition for his generous contribution of time.
+Dr Seth Flaxman of the Department of Mathematics and the Data Science Institute, Imperial College London was of great help in getting this project off the ground. There is much more work to be done--but we would like to give him recognition for his generous contribution of time.
 
 ### Contacts
 
